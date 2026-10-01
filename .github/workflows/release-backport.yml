@@ -1,0 +1,111 @@
+name: Release USVFS (backport)
+
+# Builds the 0.5.6.x line (MSBuild/vsbuild, pre-CMake) and publishes the binaries
+# that can be dropped into a matching Mod Organizer 2 release.
+
+on:
+  push:
+    tags:
+      - "v0.5.6.*-woa*"
+  workflow_dispatch:
+
+env:
+  BOOST_PREBUILT_URL: "https://github.com/ModOrganizer2/mob/releases/download/2.5-dependencies/boost_prebuilt_1_85_0.7z"
+
+jobs:
+  build:
+    name: Build USVFS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Fetch Boost prebuilt
+        run: |
+          Invoke-WebRequest -Uri ${env:BOOST_PREBUILT_URL} -OutFile boost.7z
+          Expand-7ZipArchive -Path boost.7z -Destination .\boost
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: ${{ matrix.arch }}
+
+      - name: Build
+        run: |
+          msbuild -nologo `
+            -maxCpuCount "-property:UseMultiToolTask=true" "-property:EnforceProcessCountAcrossBuilds=true" `
+            "-property:Configuration=Release" `
+            "-property:Platform=${{ matrix.arch }}" `
+            "-property:BOOST_PATH=..\boost" `
+            "-property:RunCodeAnalysis=false" `
+            .\vsbuild\usvfs.sln
+
+      - name: Stage artifacts
+        run: |
+          $arch = "${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path staging\bin, staging\lib, staging\pdb | Out-Null
+          Copy-Item "lib\usvfs_$arch.dll" staging\bin\
+          Copy-Item "bin\usvfs_proxy_$arch.exe" staging\bin\
+          Copy-Item "lib\usvfs_$arch.lib" staging\lib\
+          Copy-Item "lib\usvfs_$arch.pdb" staging\pdb\ -ErrorAction SilentlyContinue
+          Copy-Item "bin\usvfs_proxy_$arch.pdb" staging\pdb\ -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse -File staging | Select-Object FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usvfs_Release_${{ matrix.arch }}
+          path: ./staging
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: usvfs_Release_*
+          merge-multiple: true
+          path: ./install
+
+      - name: Verify payload
+        run: |
+          $expected = @(
+            "install\bin\usvfs_x64.dll",
+            "install\bin\usvfs_x86.dll",
+            "install\bin\usvfs_proxy_x64.exe",
+            "install\bin\usvfs_proxy_x86.exe"
+          )
+          $missing = $expected | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Missing expected files: $($missing -join ', ')" }
+          Get-ChildItem install\bin | ForEach-Object { "{0,-24} {1}" -f $_.Name, $_.VersionInfo.FileVersion }
+
+      - name: Create archive
+        id: archive
+        run: |
+          $name = "${{ github.ref_type == 'tag' && github.ref_name || format('{0}-dev', github.sha) }}"
+          7z a "usvfs_$name.7z" ./install/*
+          "name=usvfs_$name.7z" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usvfs-release-archive
+          path: ./${{ steps.archive.outputs.name }}
+
+      - name: Publish Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            --prerelease `
+            --title "${{ github.ref_name }}" `
+            --notes "usvfs 0.5.6.1 plus the Windows-on-ARM x64 injection stub stack-alignment fix. Drop-in replacement for the usvfs binaries shipped with Mod Organizer 2.5.2." `
+            "./${{ steps.archive.outputs.name }}"
